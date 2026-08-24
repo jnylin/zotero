@@ -124,6 +124,10 @@ Zotero.Duplicates.prototype._findDuplicates = async function () {
 		return str;
 	}
 	
+	function normalizeTitle(str) {
+		return normalizeString(str).replace(/^(the|a|an)\s+/, '');
+	}
+	
 	function sortByValue(a, b) {
 		if((a.value === null && b.value !== null)
 			|| (a.value === undefined && b.value !== undefined)
@@ -288,9 +292,11 @@ Zotero.Duplicates.prototype._findDuplicates = async function () {
 		rows = rows.map(function (row) {
 			return {
 				itemID: row.itemID,
-				value: normalizeString(row.value)
+				value: normalizeTitle(row.value)
 			};
 		});
+		// Untitled items never match on title
+		rows = rows.filter(row => row.value !== "");
 		//sort rows by normalized values
 		rows.sort(sortByValue);
 		
@@ -329,19 +335,40 @@ Zotero.Duplicates.prototype._findDuplicates = async function () {
 			creatorRowsCache[lastItemID] = itemCreators;
 		}
 		
-		processRows(rows, function (a, b) {
-			var aTitle = a.value;
-			var bTitle = b.value;
-			
-			// If we stripped one of the strings completely, we can't compare them
-			if(!aTitle || !bTitle) {
-				return -1;
+		// Minimum normalized-title similarity (1 - Levenshtein distance / longer length)
+		// for two titles to be considered a fuzzy match
+		const TITLE_SIMILARITY_THRESHOLD = 0.9;
+		// Titles longer than this are compared for exact equality only, to bound the cost
+		// of a pathological pairwise Levenshtein comparison (e.g. an abstract stored as title)
+		const TITLE_FUZZY_MAX_LENGTH = 200;
+		// Rows are sorted by normalized title, so rows sharing an identical prefix of this
+		// length are contiguous and can be grouped into a block for pairwise comparison
+		// without comparing the whole library against itself
+		const TITLE_BLOCK_PREFIX_LENGTH = 5;
+		// Blocks larger than this skip pairwise fuzzy comparison (which would be O(n^2))
+		// and fall back to grouping by exact title only
+		const TITLE_BLOCK_MAX_SIZE = 25;
+		// Number of rows compared across the boundary of two adjacent blocks, to catch a
+		// difference that falls within the blocking prefix and would otherwise split an
+		// otherwise-matching pair into separate blocks
+		const TITLE_BLOCK_BOUNDARY_WINDOW = 3;
+		
+		function titlesMatch(aTitle, bTitle) {
+			if (aTitle === bTitle) {
+				return true;
 			}
-			
-			if (aTitle !== bTitle) {
-				return -1;	//everything is sorted by title, so if this mismatches, everything following will too
+			if (aTitle.length > TITLE_FUZZY_MAX_LENGTH || bTitle.length > TITLE_FUZZY_MAX_LENGTH) {
+				return false;
 			}
-			
+			let maxLen = Math.max(aTitle.length, bTitle.length);
+			let ratio = 1 - (Zotero.Utilities.levenshtein(aTitle, bTitle) / maxLen);
+			return ratio >= TITLE_SIMILARITY_THRESHOLD;
+		}
+		
+		// Checks all non-title signals used to corroborate (or veto) a title match.
+		// Returns 0 (not a dupe) or 1 (all checks passed) -- never -1, since unlike
+		// processRows() this isn't relying on sort-order to skip remaining comparisons
+		function titleCandidatesCorroborate(a, b) {
 			// If both items have a DOI and they don't match, it's not a dupe
 			if (typeof doiCache[a.itemID] != 'undefined'
 					&& typeof doiCache[b.itemID] != 'undefined'
@@ -360,6 +387,18 @@ Zotero.Duplicates.prototype._findDuplicates = async function () {
 			if (typeof yearCache[a.itemID] != 'undefined'
 					&& typeof yearCache[b.itemID] != 'undefined'
 					&& Math.abs(yearCache[a.itemID] - yearCache[b.itemID]) > 1) {
+				return 0;
+			}
+			
+			// If both titles contain a digit run (a year, edition, volume, or part number)
+			// and they don't match exactly, it's not a dupe. This is needed because fuzzy
+			// title matching would otherwise conflate templated titles that differ only by
+			// such a number, e.g. "Annual Report 2019" vs "Annual Report 2018"
+			let aDigitRuns = a.value.match(/\d+/g);
+			let bDigitRuns = b.value.match(/\d+/g);
+			if (aDigitRuns && bDigitRuns
+					&& (aDigitRuns.length != bDigitRuns.length
+						|| aDigitRuns.some((run, i) => run != bDigitRuns[i]))) {
 				return 0;
 			}
 			
@@ -398,7 +437,90 @@ Zotero.Duplicates.prototype._findDuplicates = async function () {
 			}
 			
 			return 0;
-		}, true);
+		}
+		
+		function tryMatchTitleRows(a, b) {
+			if (!titlesMatch(a.value, b.value)) {
+				return;
+			}
+			if (!titleCandidatesCorroborate(a, b)) {
+				return;
+			}
+			sets.union(
+				self._getObjectFromID(a.itemID),
+				self._getObjectFromID(b.itemID)
+			);
+		}
+		
+		// Group rows into blocks of contiguous rows (after sorting by normalized title)
+		// sharing an identical prefix
+		let blocks = [];
+		let currentBlock = null;
+		let currentKey = null;
+		for (let i = 0; i < rows.length; i++) {
+			let row = rows[i];
+			let key = row.value.length > TITLE_BLOCK_PREFIX_LENGTH
+				? row.value.substr(0, TITLE_BLOCK_PREFIX_LENGTH)
+				: row.value;
+			if (key !== currentKey) {
+				currentBlock = [];
+				blocks.push(currentBlock);
+				currentKey = key;
+			}
+			currentBlock.push(row);
+		}
+		
+		for (let i = 0; i < blocks.length; i++) {
+			let block = blocks[i];
+			
+			if (block.length > 1) {
+				if (block.length <= TITLE_BLOCK_MAX_SIZE) {
+					for (let j = 0; j < block.length; j++) {
+						for (let k = j + 1; k < block.length; k++) {
+							tryMatchTitleRows(block[j], block[k]);
+						}
+					}
+				}
+				else {
+					Zotero.debug("Duplicates: skipping fuzzy title comparison for oversized "
+						+ `block ("${block[0].value}...", ${block.length} items)`);
+					// Still catch exact-title duplicates within the block, in groups small
+					// enough to compare pairwise cheaply
+					let exactGroups = {};
+					for (let j = 0; j < block.length; j++) {
+						let row = block[j];
+						if (!exactGroups[row.value]) {
+							exactGroups[row.value] = [];
+						}
+						exactGroups[row.value].push(row);
+					}
+					for (let key in exactGroups) {
+						let group = exactGroups[key];
+						for (let j = 0; j < group.length; j++) {
+							for (let k = j + 1; k < group.length; k++) {
+								tryMatchTitleRows(group[j], group[k]);
+							}
+						}
+					}
+				}
+			}
+			
+			// Compare rows across the boundary with the next block, in case a difference
+			// within the blocking prefix split an otherwise-matching pair apart
+			if (i + 1 < blocks.length) {
+				let tail = block.slice(-TITLE_BLOCK_BOUNDARY_WINDOW);
+				let head = blocks[i + 1].slice(0, TITLE_BLOCK_BOUNDARY_WINDOW);
+				for (let j = 0; j < tail.length; j++) {
+					for (let k = 0; k < head.length; k++) {
+						tryMatchTitleRows(tail[j], head[k]);
+					}
+				}
+			}
+			
+			if (i % 20 == 0) {
+				await Zotero.Promise.delay(0);
+			}
+		}
 	}
 	
 	// Match on exact fields

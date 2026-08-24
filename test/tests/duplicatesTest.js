@@ -110,4 +110,53 @@ describe("Duplicate Items", function () {
 			assert.sameMembers(item3.relatedItems, [item1.key]);
 		});
 	});
+
+	describe("Fuzzy title matching", function () {
+		async function getDuplicateSets() {
+			var duplicates = new Zotero.Duplicates(Zotero.Libraries.userLibraryID);
+			var search = await duplicates.getSearchObject();
+			return search.search();
+		}
+
+		it("should match titles differing by a typo", async function () {
+			var item1 = await createDataObject('item', { itemType: 'book', title: 'The Pragmatic Programmer' });
+			var item2 = await createDataObject('item', { itemType: 'book', title: 'The Pragmatic Programer' });
+
+			var ids = await getDuplicateSets();
+			assert.include(ids, item1.id);
+			assert.include(ids, item2.id);
+		});
+
+		it("should match titles differing only by a leading article", async function () {
+			var item1 = await createDataObject('item', { itemType: 'book', title: 'The Great Gatsby' });
+			var item2 = await createDataObject('item', { itemType: 'book', title: 'Great Gatsby' });
+
+			var ids = await getDuplicateSets();
+			assert.include(ids, item1.id);
+			assert.include(ids, item2.id);
+		});
+
+		it("should not match dissimilar titles that share a block prefix", async function () {
+			var item1 = await createDataObject('item', { itemType: 'book', title: 'Clean Code' });
+			var item2 = await createDataObject('item', { itemType: 'book', title: 'Clean Slate' });
+
+			var ids = await getDuplicateSets();
+			assert.notInclude(ids, item1.id);
+			assert.notInclude(ids, item2.id);
+		});
+
+		it("should not match templated titles that differ by a digit run, even within the year tolerance", async function () {
+			var item1 = await createDataObject('item', { itemType: 'book', title: 'Annual Report 2019' });
+			item1.setField('date', '2019');
+			await item1.saveTx();
+
+			var item2 = await createDataObject('item', { itemType: 'book', title: 'Annual Report 2018' });
+			item2.setField('date', '2018');
+			await item2.saveTx();
+
+			var ids = await getDuplicateSets();
+			assert.notInclude(ids, item1.id);
+			assert.notInclude(ids, item2.id);
+		});
+	});
 });
